@@ -154,47 +154,51 @@ def test_main(num_tokens: int,
                         for zero_copy in (False, ) if use_logfmt else (False, True):
                             overlap_modes = (False, True) if return_recv_hook and not use_logfmt and not shrink_test and not zero_copy else (False, )
                             for overlap in overlap_modes:
-                                if zero_copy:
-                                    buffer.get_next_low_latency_combine_buffer(handle)[:, :, :] = simulated_gemm_x
-                                out = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
-                                block_m, threshold = 64, 1
-                                num_signals_per_expert = (num_ranks * num_tokens + block_m - 1) // block_m
-                                comp_signal = torch.ones(num_local_experts * num_signals_per_expert,
-                                                         dtype=torch.int32,
-                                                         device='cuda') if overlap else None
-                                combined_x, event, hook = buffer.low_latency_combine(
-                                    simulated_gemm_x,
-                                    topk_idx,
-                                    topk_weights,
-                                    handle,
-                                    use_logfmt=use_logfmt,
-                                    async_finish=not return_recv_hook,
-                                    zero_copy=zero_copy,
-                                    return_recv_hook=return_recv_hook,
-                                    out=out,
-                                    overlap=overlap,
-                                    packed_recv_count=packed_recv_count if overlap else None,
-                                    comp_signal=comp_signal,
-                                    block_m=block_m,
-                                    threshold=threshold,
-                                    num_sms=4 if overlap else 0,
-                                    use_dual_qp=False)
-                                hook() if return_recv_hook else event.current_stream_wait()
-                            if shrink_test:
-                                query_mask_buffer_and_check("combine", buffer, mask_status, expected_masked_ranks)
-                            if do_check:
-                                if shrink_test:
-                                    owner_by_expert = (torch.arange(num_experts, device='cuda') // num_local_experts)
-                                    fail_owner_mask = (mask_status == 1).index_select(0, owner_by_expert)
-                                    valid_topk_idx = topk_idx >= 0
-                                    failed_topk_idx = torch.zeros_like(topk_idx, device='cuda', dtype=torch.bool)
-                                    failed_topk_idx[valid_topk_idx] = fail_owner_mask.index_select(0, topk_idx[valid_topk_idx])
-                                    topk_idx[failed_topk_idx] = -1
-                                diff = calc_diff(current_x * topk_weights.masked_fill(topk_idx == -1, 0).sum(dim=1).view(-1, 1), combined_x)
-                                assert torch.isnan(combined_x).sum().item() == 0
-                                if not round_scale:
-                                    assert diff < (9e-4 if dispatch_use_fp8 else 1e-5), f'Error: {diff=}, {dispatch_use_fp8=}, {zero_copy=}'
-                                hash_value ^= hash_tensor(combined_x)
+                                use_dual_qp_modes = (False, True) if not shrink_test else (False, )
+                                for use_dual_qp in use_dual_qp_modes:
+                                    if zero_copy:
+                                        buffer.get_next_low_latency_combine_buffer(handle)[:, :, :] = simulated_gemm_x
+                                    out = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
+                                    block_m, threshold = 64, 1
+                                    num_signals_per_expert = (num_ranks * num_tokens + block_m - 1) // block_m
+                                    comp_signal = torch.ones(num_local_experts * num_signals_per_expert,
+                                                             dtype=torch.int32,
+                                                             device='cuda') if overlap else None
+                                    combined_x, event, hook = buffer.low_latency_combine(
+                                        simulated_gemm_x,
+                                        topk_idx,
+                                        topk_weights,
+                                        handle,
+                                        use_logfmt=use_logfmt,
+                                        async_finish=not return_recv_hook,
+                                        zero_copy=zero_copy,
+                                        return_recv_hook=return_recv_hook,
+                                        out=out,
+                                        overlap=overlap,
+                                        packed_recv_count=packed_recv_count if overlap else None,
+                                        comp_signal=comp_signal,
+                                        block_m=block_m,
+                                        threshold=threshold,
+                                        num_sms=4 if overlap else 0,
+                                        use_dual_qp=use_dual_qp)
+                                    hook() if return_recv_hook else event.current_stream_wait()
+                                    if shrink_test:
+                                        query_mask_buffer_and_check("combine", buffer, mask_status, expected_masked_ranks)
+                                    if do_check:
+                                        if shrink_test:
+                                            owner_by_expert = (torch.arange(num_experts, device='cuda') // num_local_experts)
+                                            fail_owner_mask = (mask_status == 1).index_select(0, owner_by_expert)
+                                            valid_topk_idx = topk_idx >= 0
+                                            failed_topk_idx = torch.zeros_like(topk_idx, device='cuda', dtype=torch.bool)
+                                            failed_topk_idx[valid_topk_idx] = fail_owner_mask.index_select(0, topk_idx[valid_topk_idx])
+                                            topk_idx[failed_topk_idx] = -1
+                                        diff = calc_diff(current_x * topk_weights.masked_fill(topk_idx == -1, 0).sum(dim=1).view(-1, 1), combined_x)
+                                        assert torch.isnan(combined_x).sum().item() == 0
+                                        if not round_scale:
+                                            assert diff < (9e-4 if dispatch_use_fp8 else 1e-5), \
+                                                f'Error: {diff=}, {dispatch_use_fp8=}, {zero_copy=}, {overlap=}, {use_dual_qp=}'
+                                        if not use_dual_qp:
+                                            hash_value ^= hash_tensor(combined_x)
 
                         # Clean buffer API
                         if shrink_test:
@@ -278,7 +282,7 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     buffer = deep_ep.Buffer(group,
                             num_rdma_bytes=num_rdma_bytes,
                             low_latency_mode=True,
-                            num_qps_per_rank=num_experts // num_ranks,
+                            num_qps_per_rank=2 * num_experts // num_ranks,
                             allow_nvlink_for_low_latency_mode=not args.disable_nvlink,
                             explicitly_destroy=True,
                             allow_mnnvl=args.allow_mnnvl,

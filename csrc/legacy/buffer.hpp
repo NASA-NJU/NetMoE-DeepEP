@@ -1626,9 +1626,7 @@ public:
             EP_HOST_ASSERT(packed_recv_count.has_value() and "SBO overlap requires packed_recv_count");
             EP_HOST_ASSERT(comp_signal.has_value() and "SBO overlap requires comp_signal");
             EP_HOST_ASSERT(block_m > 0 and threshold > 0 and num_sms > 0);
-            EP_HOST_ASSERT(not use_dual_qp and "SBO dual-QP support is not implemented yet");
         }
-        EP_HOST_ASSERT(not use_dual_qp and "Dual-QP support is not implemented yet");
 
         // Tensor checks
         EP_HOST_ASSERT(x.dim() == 3 and x.is_contiguous() and x.scalar_type() == torch::kBFloat16);

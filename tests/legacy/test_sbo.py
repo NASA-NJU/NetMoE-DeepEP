@@ -72,43 +72,45 @@ def test_sbo(rank: int,
 
     # Allocate for the smallest supported block so the actual JIT-selected layout always fits.
     max_signal_stride = (capacity + 15) // 16
-    comp_signal = torch.zeros(num_local_experts * max_signal_stride, dtype=torch.int32, device='cuda')
-    sbo_gemm_out = torch.empty_like(baseline_gemm_out)
-    gemm_stream = torch.cuda.Stream()
-    gemm_stream.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(gemm_stream):
-        sbo_config = deep_gemm.m_grouped_fp8_gemm_nt_sbo_masked(
-            packed_recv_x,
-            weights,
+    for use_dual_qp in (False, True):
+        comp_signal = torch.zeros(num_local_experts * max_signal_stride, dtype=torch.int32, device='cuda')
+        sbo_gemm_out = torch.empty_like(baseline_gemm_out)
+        gemm_stream = torch.cuda.Stream()
+        gemm_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(gemm_stream):
+            sbo_config = deep_gemm.m_grouped_fp8_gemm_nt_sbo_masked(
+                packed_recv_x,
+                weights,
+                sbo_gemm_out,
+                packed_recv_count,
+                expected_m,
+                disable_ue8m0_cast=True,
+                send_signal=comp_signal.data_ptr())
+        assert sbo_config is not None, 'DeepGEMM SBO requires an SM90 kernel'
+        block_m, threshold = sbo_config
+
+        sbo_combined, _, recv_hook = buffer.low_latency_combine(
             sbo_gemm_out,
-            packed_recv_count,
-            expected_m,
-            disable_ue8m0_cast=True,
-            send_signal=comp_signal.data_ptr())
-    assert sbo_config is not None, 'DeepGEMM SBO requires an SM90 kernel'
-    block_m, threshold = sbo_config
+            topk_idx,
+            topk_weights,
+            handle,
+            zero_copy=False,
+            return_recv_hook=True,
+            overlap=True,
+            packed_recv_count=packed_recv_count,
+            comp_signal=comp_signal,
+            block_m=block_m,
+            threshold=threshold,
+            num_sms=num_sbo_sms,
+            use_dual_qp=use_dual_qp)
+        recv_hook()
+        torch.cuda.synchronize()
 
-    sbo_combined, _, recv_hook = buffer.low_latency_combine(
-        sbo_gemm_out,
-        topk_idx,
-        topk_weights,
-        handle,
-        zero_copy=False,
-        return_recv_hook=True,
-        overlap=True,
-        packed_recv_count=packed_recv_count,
-        comp_signal=comp_signal,
-        block_m=block_m,
-        threshold=threshold,
-        num_sms=num_sbo_sms)
-    recv_hook()
-    torch.cuda.synchronize()
-
-    diff = calc_diff(baseline_combined, sbo_combined)
-    assert torch.isnan(sbo_combined).sum().item() == 0
-    assert diff < 1e-5, f'SBO result differs from baseline: {diff=}'
-    if rank == 0:
-        print(f'SBO correctness passed: {block_m=}, {threshold=}, {diff=:.3e}', flush=True)
+        diff = calc_diff(baseline_combined, sbo_combined)
+        assert torch.isnan(sbo_combined).sum().item() == 0
+        assert diff < 1e-5, f'SBO result differs from baseline: {diff=}, {use_dual_qp=}'
+        if rank == 0:
+            print(f'SBO correctness passed: {use_dual_qp=}, {block_m=}, {threshold=}, {diff=:.3e}', flush=True)
 
 
 def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> None:
@@ -120,7 +122,7 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -
         group,
         num_rdma_bytes=num_rdma_bytes,
         low_latency_mode=True,
-        num_qps_per_rank=args.num_experts // num_ranks,
+        num_qps_per_rank=2 * args.num_experts // num_ranks,
         allow_nvlink_for_low_latency_mode=not args.disable_nvlink,
         explicitly_destroy=True)
     test_sbo(rank,
@@ -139,7 +141,7 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Test DeepGEMM and DeepEP single-QP SBO overlap')
+    parser = argparse.ArgumentParser(description='Test DeepGEMM and DeepEP single/dual-QP SBO overlap')
     parser.add_argument('--num-processes', type=int, default=8)
     parser.add_argument('--num-tokens', type=int, default=128)
     parser.add_argument('--hidden', type=int, default=2048)

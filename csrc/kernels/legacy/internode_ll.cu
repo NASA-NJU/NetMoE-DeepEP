@@ -730,7 +730,8 @@ __global__ __launch_bounds__(kNumThreads, 1) void combine_send_sbo(void* rdma_re
                                                                  int num_experts,
                                                                  int rank,
                                                                  int num_ranks,
-                                                                 bool zero_copy) {
+                                                                 bool zero_copy,
+                                                                 bool use_dual_qp) {
     constexpr int kNumWarpsPerBlock = kNumThreads / 32;
     constexpr int kNumElemsPerInt4 = sizeof(int4) / sizeof(nv_bfloat16);
     constexpr int kHiddenInt4 = kHidden / kNumElemsPerInt4;
@@ -781,12 +782,19 @@ __global__ __launch_bounds__(kNumThreads, 1) void combine_send_sbo(void* rdma_re
                 if (signal_idx != previous_signal_idx) {
                     const auto signal_ptr = comp_signal + local_expert_idx * num_signals_per_expert + signal_idx;
                     const auto start_time = clock64();
-                    auto wait_cycles = static_cast<uint64_t>(0);
-                    while (ld_acquire_global(signal_ptr) < threshold and not rank_masked and wait_cycles <= LEGACY_NUM_TIMEOUT_CYCLES) {
-                        rank_masked = is_rank_masked<true>(mask_buffer_ptr, dst_rank);
-                        wait_cycles = clock64() - start_time;
+                    int wait_state = 0;  // 0: waiting, 1: ready, 2: masked, 3: timeout
+                    while (wait_state == 0) {
+                        if (lane_id == 0) {
+                            if (ld_acquire_global(signal_ptr) >= threshold)
+                                wait_state = 1;
+                            else if (is_rank_masked(mask_buffer_ptr, dst_rank))
+                                wait_state = 2;
+                            else if (clock64() - start_time > LEGACY_NUM_TIMEOUT_CYCLES)
+                                wait_state = 3;
+                        }
+                        wait_state = __shfl_sync(0xffffffff, wait_state, 0);
                     }
-                    if (wait_cycles > LEGACY_NUM_TIMEOUT_CYCLES) {
+                    if (wait_state == 3) {
                         if (lane_id == 0)
                             printf("Warning: DeepEP timeout waiting for SBO signal, rank %d, local_expert_idx %d, dst_rank %d, signal_idx %d\n",
                                    rank,
@@ -797,8 +805,8 @@ __global__ __launch_bounds__(kNumThreads, 1) void combine_send_sbo(void* rdma_re
                             trap();
                         else if (lane_id == 0)
                             atomicExch(mask_buffer_ptr + dst_rank, 1);
-                        rank_masked = true;
                     }
+                    rank_masked = wait_state != 1;
                     __syncwarp();
                     previous_signal_idx = signal_idx;
                 }
@@ -818,13 +826,22 @@ __global__ __launch_bounds__(kNumThreads, 1) void combine_send_sbo(void* rdma_re
                         UNROLLED_WARP_COPY(4, lane_id, kHiddenInt4, send_int4, x_int4, ld_nc_global, st_na_global);
                         __syncwarp();
                     }
-                    nvshmemi_ibgda_put_nbi_warp(dst_ptr,
-                                                reinterpret_cast<uint64_t>(send_row),
-                                                kNumSendBytes,
-                                                dst_rank,
-                                                local_expert_idx,
-                                                lane_id,
-                                                token_idx - offset);
+                    if (use_dual_qp)
+                        nvshmemi_ibgda_put_nbi_warp_dual_qp(dst_ptr,
+                                                            reinterpret_cast<uint64_t>(send_row),
+                                                            kNumSendBytes,
+                                                            dst_rank,
+                                                            local_expert_idx,
+                                                            lane_id,
+                                                            token_idx - offset);
+                    else
+                        nvshmemi_ibgda_put_nbi_warp(dst_ptr,
+                                                   reinterpret_cast<uint64_t>(send_row),
+                                                   kNumSendBytes,
+                                                   dst_rank,
+                                                   local_expert_idx,
+                                                   lane_id,
+                                                   token_idx - offset);
                 } else {
                     const auto copy_src = zero_copy ? send_int4 : x_int4;
                     const auto copy_dst = reinterpret_cast<int4*>(dst_p2p_ptr);
@@ -834,19 +851,22 @@ __global__ __launch_bounds__(kNumThreads, 1) void combine_send_sbo(void* rdma_re
             }
         }
 
-        // The finish notification is ordered after all data writes on the same peer QP.
-        if (lane_id == 0) {
+        // Each remote QP sends its own ordered finish flag; P2P writes both planes after one direct copy.
+        if (lane_id < (use_dual_qp ? 2 : 1)) {
             while (ld_acquire_global(atomic_clean_flag) == 0)
                 ;
             if (not rank_masked) {
-                const auto flag_ptr = reinterpret_cast<uint64_t>(rdma_recv_flag + global_expert_idx);
+                const int flag_idx = use_dual_qp ? lane_id : 0;
+                const auto flag_ptr = reinterpret_cast<uint64_t>(rdma_recv_flag + global_expert_idx + flag_idx * num_experts);
                 const auto flag_p2p_ptr = nvshmemi_get_p2p_ptr(flag_ptr, rank, dst_rank);
                 if (flag_p2p_ptr == 0)
-                    nvshmemi_ibgda_amo_nonfetch_add(reinterpret_cast<int*>(flag_ptr), 1, dst_rank, local_expert_idx);
+                    nvshmemi_ibgda_amo_nonfetch_add(
+                        reinterpret_cast<int*>(flag_ptr), 1, dst_rank, (use_dual_qp ? 2 : 1) * local_expert_idx + flag_idx);
                 else
                     st_release_sys_global(reinterpret_cast<int*>(flag_p2p_ptr), 1);
             }
-            atomic_add_release_global(atomic_clean_flag, -1);
+            if (lane_id == 0)
+                atomic_add_release_global(atomic_clean_flag, -1);
         }
         __syncwarp();
     }
@@ -877,7 +897,8 @@ __global__ __launch_bounds__(1024, 1) void combine(void* combined_x,
                                                    int num_warp_groups,
                                                    int num_warps_per_group,
                                                    int phases,
-                                                   bool zero_copy) {
+                                                   bool zero_copy,
+                                                   bool use_dual_qp) {
     const auto sm_id = __shfl_sync(0xffffffff, static_cast<int>(blockIdx.x), 0);
     const auto num_sms = __shfl_sync(0xffffffff, static_cast<int>(gridDim.x), 0);
     const auto thread_id = static_cast<int>(threadIdx.x);
@@ -1048,27 +1069,36 @@ __global__ __launch_bounds__(1024, 1) void combine(void* combined_x,
 
                 // Issue RDMA
                 // NOTES: for zero-copy mode, we assume the data is already in the send buffer
-                if (dst_p2p_ptr == 0)
-                    nvshmemi_ibgda_put_nbi_warp(dst_ptr, buf_ptr, num_send_bytes, dst_rank, local_expert_idx, lane_id, token_idx - offset);
+                if (dst_p2p_ptr == 0) {
+                    if (use_dual_qp)
+                        nvshmemi_ibgda_put_nbi_warp_dual_qp(
+                            dst_ptr, buf_ptr, num_send_bytes, dst_rank, local_expert_idx, lane_id, token_idx - offset);
+                    else
+                        nvshmemi_ibgda_put_nbi_warp(
+                            dst_ptr, buf_ptr, num_send_bytes, dst_rank, local_expert_idx, lane_id, token_idx - offset);
+                }
             }
         }
 
         // Put the finishing flag
         EP_DEVICE_ASSERT(num_warps_per_group > 1 and num_warp_groups < 16);
         asm volatile("bar.sync %0, %1;" ::"r"(warp_group_id + 1), "r"(num_warps_per_group * 32));
-        if (sub_warp_id == 1 and lane_id == 0) {
+        if (sub_warp_id == 1 and lane_id < (use_dual_qp ? 2 : 1)) {
             while (ld_acquire_global(atomic_clean_flag) == 0)
                 ;
-            auto dst_ptr = reinterpret_cast<uint64_t>(rdma_recv_flag + global_expert_idx);
+            const int flag_idx = use_dual_qp ? lane_id : 0;
+            auto dst_ptr = reinterpret_cast<uint64_t>(rdma_recv_flag + global_expert_idx + flag_idx * num_experts);
             auto dst_p2p_ptr = nvshmemi_get_p2p_ptr(dst_ptr, rank, dst_rank);
             if (not is_rank_masked(mask_buffer_ptr, dst_rank)) {
                 if (dst_p2p_ptr == 0) {
-                    nvshmemi_ibgda_amo_nonfetch_add(reinterpret_cast<int*>(dst_ptr), 1, dst_rank, local_expert_idx);
+                    nvshmemi_ibgda_amo_nonfetch_add(
+                        reinterpret_cast<int*>(dst_ptr), 1, dst_rank, (use_dual_qp ? 2 : 1) * local_expert_idx + flag_idx);
                 } else {
                     st_release_sys_global(reinterpret_cast<int*>(dst_p2p_ptr), 1);
                 }
             }
-            atomic_add_release_global(atomic_clean_flag, -1);
+            if (lane_id == 0)
+                atomic_add_release_global(atomic_clean_flag, -1);
         }
         __syncwarp();
 
@@ -1088,12 +1118,13 @@ LOW_LATENCY_COMBINE_RECV:
     // Wait all ranks to arrive
     if (responsible_expert_idx < num_experts) {
         EP_DEVICE_ASSERT(num_warps_per_group > 1);
-        if (sub_warp_id == 0 and lane_id == 0) {
+        if (sub_warp_id == 0 and lane_id < (use_dual_qp ? 2 : 1)) {
             const auto src_rank = responsible_expert_idx / num_local_experts;
+            const int flag_idx = use_dual_qp ? lane_id : 0;
             auto start_time = clock64();
             uint64_t wait_recv_cost = 0;
             if (not is_rank_masked(mask_buffer_ptr, src_rank)) {
-                while (ld_acquire_sys_global(rdma_recv_flag + responsible_expert_idx) == 0  // recv not ready
+                while (ld_acquire_sys_global(rdma_recv_flag + responsible_expert_idx + flag_idx * num_experts) == 0  // recv not ready
                        && (wait_recv_cost = clock64() - start_time) <= LEGACY_NUM_TIMEOUT_CYCLES   // not timeout
                 )
                     ;
@@ -1110,7 +1141,14 @@ LOW_LATENCY_COMBINE_RECV:
             }
 
             if (combine_wait_recv_cost_stats != nullptr) {
-                atomicAdd(reinterpret_cast<unsigned long long*>(combine_wait_recv_cost_stats + src_rank), wait_recv_cost);
+                if (use_dual_qp) {
+                    const auto peer_wait_recv_cost = __shfl_sync(0x3, wait_recv_cost, 1);
+                    if (lane_id == 0)
+                        atomicAdd(reinterpret_cast<unsigned long long*>(combine_wait_recv_cost_stats + src_rank),
+                                  max(wait_recv_cost, peer_wait_recv_cost));
+                } else {
+                    atomicAdd(reinterpret_cast<unsigned long long*>(combine_wait_recv_cost_stats + src_rank), wait_recv_cost);
+                }
             }
         }
     }
@@ -1311,7 +1349,6 @@ void combine(void* combined_x,
              cudaStream_t stream,
              int phases,
              bool zero_copy) {
-    EP_HOST_ASSERT(not use_dual_qp and "Dual-QP support is not implemented yet");
     if (overlap and phases == LEGACY_LOW_LATENCY_SEND_PHASE) {
         EP_HOST_ASSERT(not use_logfmt and not zero_copy and packed_recv_count != nullptr and comp_signal != nullptr);
         EP_HOST_ASSERT(block_m > 0 and threshold > 0 and num_sbo_sms > 0 and num_sbo_sms < num_device_sms);
@@ -1340,7 +1377,8 @@ void combine(void* combined_x,
             num_experts,                                                                                                    \
             rank,                                                                                                           \
             num_ranks,                                                                                                      \
-            zero_copy);                                                                                                     \
+            zero_copy,                                                                                                      \
+            use_dual_qp);                                                                                                     \
         CUDA_RUNTIME_CHECK(cudaGetLastError());                                                                              \
     }                                                                                                                       \
     break
@@ -1415,7 +1453,8 @@ void combine(void* combined_x,
                       num_warp_groups,                                                                                             \
                       num_warps_per_group,                                                                                         \
                       phases,                                                                                                      \
-                      zero_copy);                                                                                                  \
+                      zero_copy,                                                                                                   \
+                      use_dual_qp);                                                                                                  \
     }                                                                                                                              \
     break
 

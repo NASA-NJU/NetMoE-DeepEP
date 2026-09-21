@@ -49,8 +49,8 @@ class Buffer:
             num_nvl_bytes: the buffer size for intranode NVLink communication.
             num_rdma_bytes: the buffer size for internode (also for intranode with low-latency mode) RDMA communication.
             low_latency_mode: whether to enable low-latency mode.
-            num_qps_per_rank: the number of QPs for RDMA, the low-latency mode requires that this number equals
-                to the number of local experts.
+            num_qps_per_rank: the number of QPs for RDMA. Low-latency mode requires at least one QP per local expert,
+                or two QPs per local expert when `use_dual_qp=True`.
             allow_nvlink_for_low_latency_mode: whether allow NVLink traffic for low-latency mode, you should notice
                 this is somehow incompatible with the hook-based overlapping.
                 Warning: PCIe connections may lead to errors due to memory ordering issues,
@@ -703,10 +703,8 @@ class Buffer:
             num_signals_per_expert = (self.group_size * num_max_dispatch_tokens_per_rank + block_m - 1) // block_m
             if comp_signal.dim() != 1 or comp_signal.numel() < num_local_experts * num_signals_per_expert:
                 raise ValueError('comp_signal is too small for the configured experts, token capacity, and block_m')
-            if use_dual_qp and self.num_qps_per_rank < 2 * num_local_experts:
-                raise ValueError(f'use_dual_qp requires at least {2 * num_local_experts} QPs per rank')
-        if use_dual_qp:
-            raise NotImplementedError('Dual-QP communication will be added in a later migration stage')
+        if use_dual_qp and self.num_qps_per_rank < 2 * num_local_experts:
+            raise ValueError(f'use_dual_qp requires at least {2 * num_local_experts} QPs per rank')
 
         combined_x, event, hook = self.runtime.low_latency_combine(
             x, topk_idx, topk_weights, src_info, layout_range, combine_wait_recv_cost_stats,

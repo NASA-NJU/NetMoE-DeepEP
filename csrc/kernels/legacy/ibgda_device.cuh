@@ -380,6 +380,73 @@ __device__ static __forceinline__ void nvshmemi_ibgda_put_nbi_warp(
     __syncwarp();
 }
 
+template <bool kAlwaysDoPostSend = false>
+__device__ static __forceinline__ void nvshmemi_ibgda_put_nbi_warp_dual_qp(
+    uint64_t req_rptr, uint64_t req_lptr, size_t bytes, int dst_pe, int logical_qp_id, int lane_id, int message_idx) {
+    constexpr int kNumQPs = 2;
+    const auto state = ibgda_get_state();
+    const int num_qps_per_peer = state->num_rc_per_pe * state->num_devices_initialized;
+    const int qp_base = logical_qp_id * kNumQPs;
+    EP_DEVICE_ASSERT(qp_base + 1 < num_qps_per_peer);
+
+    // One leader lane owns each QP. Both leaders execute concurrently while all other lanes remain idle.
+    if (lane_id < kNumQPs) {
+        const int qp_offset = lane_id;
+        auto qp = ibgda_get_rc(dst_pe, qp_base + qp_offset);
+        const size_t first_half_bytes = bytes / 2;
+        const size_t half_offset = qp_offset == 0 ? 0 : first_half_bytes;
+        const size_t half_bytes = qp_offset == 0 ? first_half_bytes : bytes - first_half_bytes;
+
+        // Pass 1 counts WQEs across the NIC-specific local and remote MR boundaries.
+        uint32_t num_wqes = 0;
+        size_t remaining_bytes = half_bytes;
+        uint64_t current_lptr = req_lptr + half_offset;
+        uint64_t current_rptr = req_rptr + half_offset;
+        while (remaining_bytes > 0) {
+            __be32 lkey, rkey;
+            uint64_t translated_raddr;
+            const auto bytes_until_boundary = ibgda_get_lkey_and_rkey(
+                current_lptr, &lkey, current_rptr, dst_pe, &translated_raddr, &rkey, qp->dev_idx);
+            const auto current_bytes = min(remaining_bytes, static_cast<size_t>(bytes_until_boundary));
+            current_lptr += current_bytes;
+            current_rptr += current_bytes;
+            remaining_bytes -= current_bytes;
+            ++num_wqes;
+        }
+
+        const auto base_wqe_idx = ibgda_reserve_wqe_slots(qp, num_wqes);
+
+        // Pass 2 repeats the boundary walk and writes the reserved WQEs without a fixed segment-count limit.
+        remaining_bytes = half_bytes;
+        current_lptr = req_lptr + half_offset;
+        current_rptr = req_rptr + half_offset;
+        uint32_t local_wqe_idx = 0;
+        while (remaining_bytes > 0) {
+            __be32 lkey, rkey;
+            uint64_t translated_raddr;
+            const auto bytes_until_boundary = ibgda_get_lkey_and_rkey(
+                current_lptr, &lkey, current_rptr, dst_pe, &translated_raddr, &rkey, qp->dev_idx);
+            const auto current_bytes = min(remaining_bytes, static_cast<size_t>(bytes_until_boundary));
+            const auto wqe_idx = base_wqe_idx + local_wqe_idx;
+            auto wqe_ptr = ibgda_get_wqe_ptr(qp, wqe_idx);
+            ibgda_write_rdma_write_wqe(qp,
+                                       current_lptr,
+                                       lkey,
+                                       translated_raddr,
+                                       rkey,
+                                       static_cast<uint32_t>(current_bytes),
+                                       wqe_idx,
+                                       &wqe_ptr);
+            current_lptr += current_bytes;
+            current_rptr += current_bytes;
+            remaining_bytes -= current_bytes;
+            ++local_wqe_idx;
+        }
+        ibgda_submit_requests<kAlwaysDoPostSend>(qp, base_wqe_idx, num_wqes, message_idx);
+    }
+    __syncwarp();
+}
+
 __device__ static __forceinline__ void ibgda_write_amo_add_wqe(nvshmemi_ibgda_device_qp_t* qp,
                                                                const int& value,
                                                                uint64_t laddr,
