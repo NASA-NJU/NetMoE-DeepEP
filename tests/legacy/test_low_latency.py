@@ -163,7 +163,9 @@ def test_main(num_tokens: int,
                                                                                  async_finish=not return_recv_hook,
                                                                                  zero_copy=zero_copy,
                                                                                  return_recv_hook=return_recv_hook,
-                                                                                 out=out)
+                                                                                 out=out,
+                                                                                 overlap=False,
+                                                                                 use_dual_qp=False)
                             hook() if return_recv_hook else event.current_stream_wait()
                             if shrink_test:
                                 query_mask_buffer_and_check("combine", buffer, mask_status, expected_masked_ranks)

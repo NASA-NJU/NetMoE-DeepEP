@@ -87,6 +87,7 @@ class Buffer:
         self.num_nvl_bytes = num_nvl_bytes
         self.num_rdma_bytes = num_rdma_bytes
         self.low_latency_mode = low_latency_mode
+        self.num_qps_per_rank = num_qps_per_rank
         self.explicitly_destroy = explicitly_destroy
         self.enable_shrink = enable_shrink
         self.runtime = _C.Buffer(self.rank, self.group_size, num_nvl_bytes, num_rdma_bytes, low_latency_mode,
@@ -624,8 +625,10 @@ class Buffer:
     def low_latency_combine(self, x: torch.Tensor, topk_idx: torch.Tensor, topk_weights: torch.Tensor,
                             handle: tuple, use_logfmt: bool = False, zero_copy: bool = False, async_finish: bool = False,
                             return_recv_hook: bool = False, out: Optional[torch.Tensor] = None,
-                            combine_wait_recv_cost_stats: Optional[torch.Tensor] = None) -> \
-            Tuple[torch.Tensor, EventOverlap, Callable]:
+                            combine_wait_recv_cost_stats: Optional[torch.Tensor] = None,
+                            overlap: bool = False, packed_recv_count: Optional[torch.Tensor] = None,
+                            comp_signal: Optional[torch.Tensor] = None, block_m: int = 64, threshold: int = 0,
+                            num_sms: int = 0, use_dual_qp: bool = False) -> Tuple[torch.Tensor, EventOverlap, Callable]:
         """
         A low-latency implementation for combining tokens (reduce **with weights**) with IBGDA.
         This kernel requires all the ranks (no matter intranode or internode) should be visible via RDMA
@@ -653,6 +656,13 @@ class Buffer:
             combine_wait_recv_cost_stats: a cumulative time spent waiting to receive each token tensor for statistics,
                 which should have shape `[num_ranks, num_ranks]` and be typed as `torch.int64`.
                 This is useful for detecting and precisely localizing slow anomalies.
+            overlap: whether to overlap the DeepGEMM down-projection with the combine send phase.
+            packed_recv_count: `[num_local_experts]` with `torch.int32`, indicating the valid token count of each expert.
+            comp_signal: the `torch.int32` completion signal produced by DeepGEMM for each expert token block.
+            block_m: the number of tokens represented by each completion signal element.
+            threshold: a block can be sent after its completion signal reaches this value.
+            num_sms: the number of SMs reserved for the SBO combine send phase.
+            use_dual_qp: whether each remote token is split across two QPs.
 
         Returns:
             combined_x: the reduced token tensor, with shape `[num_combined_tokens, hidden]` and type `torch.bfloat16`.
@@ -662,11 +672,41 @@ class Buffer:
         check_torch_deterministic()
 
         src_info, layout_range, num_max_dispatch_tokens_per_rank, hidden, num_experts = handle
+        num_local_experts = num_experts // self.group_size
         assert self.nvshmem_qp_depth >= (num_max_dispatch_tokens_per_rank + 1) * 2
-        combined_x, event, hook = self.runtime.low_latency_combine(x, topk_idx, topk_weights, src_info, layout_range,
-                                                                   combine_wait_recv_cost_stats, num_max_dispatch_tokens_per_rank,
-                                                                   num_experts, use_logfmt, zero_copy, async_finish, return_recv_hook, out)
+
+        if overlap:
+            if not return_recv_hook:
+                raise ValueError('SBO overlap requires return_recv_hook=True')
+            if use_logfmt:
+                raise ValueError('SBO overlap does not support LogFMT yet')
+            if packed_recv_count is None:
+                raise ValueError('SBO overlap requires packed_recv_count')
+            if comp_signal is None:
+                raise ValueError('SBO overlap requires comp_signal')
+            if packed_recv_count.dtype != torch.int32 or packed_recv_count.device != x.device or not packed_recv_count.is_contiguous():
+                raise ValueError('packed_recv_count must be a contiguous torch.int32 tensor on the same device as x')
+            if packed_recv_count.dim() != 1 or packed_recv_count.numel() != num_local_experts:
+                raise ValueError(f'packed_recv_count must have shape [{num_local_experts}]')
+            if comp_signal.dtype != torch.int32 or comp_signal.device != x.device or not comp_signal.is_contiguous():
+                raise ValueError('comp_signal must be a contiguous torch.int32 tensor on the same device as x')
+            if block_m <= 0 or threshold <= 0 or num_sms <= 0:
+                raise ValueError('block_m, threshold, and num_sms must be positive in SBO overlap mode')
+            num_signals_per_expert = (self.group_size * num_max_dispatch_tokens_per_rank + block_m - 1) // block_m
+            if comp_signal.dim() != 1 or comp_signal.numel() < num_local_experts * num_signals_per_expert:
+                raise ValueError('comp_signal is too small for the configured experts, token capacity, and block_m')
+            if use_dual_qp and self.num_qps_per_rank < 2 * num_local_experts:
+                raise ValueError(f'use_dual_qp requires at least {2 * num_local_experts} QPs per rank')
+            raise NotImplementedError('SBO overlap kernel will be added in the next migration stage')
+        if use_dual_qp:
+            raise NotImplementedError('Dual-QP communication will be added in a later migration stage')
+
+        combined_x, event, hook = self.runtime.low_latency_combine(
+            x, topk_idx, topk_weights, src_info, layout_range, combine_wait_recv_cost_stats,
+            num_max_dispatch_tokens_per_rank, num_experts, use_logfmt, zero_copy, async_finish,
+            return_recv_hook, out, overlap, packed_recv_count, comp_signal, block_m, threshold, num_sms, use_dual_qp)
         tensors_to_record = (x, topk_idx, topk_weights, src_info, layout_range, combined_x)
+        tensors_to_record += tuple(tensor for tensor in (packed_recv_count, comp_signal) if tensor is not None)
         return combined_x, EventOverlap(event, tensors_to_record if async_finish else None), hook
 
     def low_latency_update_mask_buffer(self, rank_to_mask: int, mask: bool = False):

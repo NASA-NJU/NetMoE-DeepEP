@@ -1608,8 +1608,25 @@ public:
         bool zero_copy,
         bool async,
         bool return_recv_hook,
-        const std::optional<torch::Tensor>& out = std::nullopt) {
+        const std::optional<torch::Tensor>& out,
+        bool overlap,
+        const std::optional<torch::Tensor>& packed_recv_count,
+        const std::optional<torch::Tensor>& comp_signal,
+        int block_m,
+        int threshold,
+        int num_sms,
+        bool use_dual_qp) {
         EP_HOST_ASSERT(low_latency_mode);
+
+        if (overlap) {
+            EP_HOST_ASSERT(return_recv_hook and "SBO overlap requires return_recv_hook=True");
+            EP_HOST_ASSERT(not use_logfmt and "SBO overlap does not support LogFMT yet");
+            EP_HOST_ASSERT(packed_recv_count.has_value() and "SBO overlap requires packed_recv_count");
+            EP_HOST_ASSERT(comp_signal.has_value() and "SBO overlap requires comp_signal");
+            EP_HOST_ASSERT(block_m > 0 and threshold > 0 and num_sms > 0);
+            EP_HOST_ASSERT(not use_dual_qp and "SBO dual-QP support is not implemented yet");
+        }
+        EP_HOST_ASSERT(not use_dual_qp and "Dual-QP support is not implemented yet");
 
         // Tensor checks
         EP_HOST_ASSERT(x.dim() == 3 and x.is_contiguous() and x.scalar_type() == torch::kBFloat16);
@@ -1632,6 +1649,18 @@ public:
             EP_HOST_ASSERT(combine_wait_recv_cost_stats->scalar_type() == torch::kInt64);
             EP_HOST_ASSERT(combine_wait_recv_cost_stats->dim() == 1 and combine_wait_recv_cost_stats->is_contiguous());
             EP_HOST_ASSERT(combine_wait_recv_cost_stats->size(0) == num_ranks);
+        }
+
+        if (overlap) {
+            const auto num_local_experts = num_experts / num_ranks;
+            const auto num_signals_per_expert = ceil_div(num_ranks * num_max_dispatch_tokens_per_rank, block_m);
+            EP_HOST_ASSERT(packed_recv_count->is_cuda() and packed_recv_count->get_device() == x.get_device());
+            EP_HOST_ASSERT(packed_recv_count->scalar_type() == torch::kInt32 and packed_recv_count->is_contiguous());
+            EP_HOST_ASSERT(packed_recv_count->dim() == 1 and packed_recv_count->numel() == num_local_experts);
+            EP_HOST_ASSERT(comp_signal->is_cuda() and comp_signal->get_device() == x.get_device());
+            EP_HOST_ASSERT(comp_signal->scalar_type() == torch::kInt32 and comp_signal->is_contiguous());
+            EP_HOST_ASSERT(comp_signal->dim() == 1 and comp_signal->numel() >= num_local_experts * num_signals_per_expert);
+            EP_HOST_ASSERT(false and "SBO overlap support is not implemented yet");
         }
 
         auto hidden = static_cast<int>(x.size(2));
@@ -1687,6 +1716,13 @@ public:
                                   rank,
                                   num_ranks,
                                   use_logfmt,
+                                  overlap,
+                                  packed_recv_count.has_value() ? packed_recv_count->data_ptr<int>() : nullptr,
+                                  comp_signal.has_value() ? comp_signal->data_ptr<int>() : nullptr,
+                                  block_m,
+                                  threshold,
+                                  num_sms,
+                                  use_dual_qp,
                                   workspace,
                                   num_device_sms,
                                   launch_stream,

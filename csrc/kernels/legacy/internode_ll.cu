@@ -1158,11 +1158,26 @@ void combine(void* combined_x,
              int rank,
              int num_ranks,
              bool use_logfmt,
+             bool overlap,
+             const int* packed_recv_count,
+             const int* comp_signal,
+             int block_m,
+             int threshold,
+             int num_sbo_sms,
+             bool use_dual_qp,
              void* workspace,
              int num_device_sms,
              cudaStream_t stream,
              int phases,
              bool zero_copy) {
+    EP_HOST_ASSERT(not overlap and "SBO overlap support is not implemented yet");
+    EP_HOST_ASSERT(not use_dual_qp and "Dual-QP support is not implemented yet");
+    (void)packed_recv_count;
+    (void)comp_signal;
+    (void)block_m;
+    (void)threshold;
+    (void)num_sbo_sms;
+
     constexpr int kNumMaxTopk = 11;
     const int num_warp_groups = ceil_div(num_experts, num_device_sms);
     const int num_warps_per_group = 32 / num_warp_groups;
