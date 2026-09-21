@@ -658,7 +658,8 @@ class Buffer:
                 This is useful for detecting and precisely localizing slow anomalies.
             overlap: whether to overlap the DeepGEMM down-projection with the combine send phase.
             packed_recv_count: `[num_local_experts]` with `torch.int32`, indicating the valid token count of each expert.
-            comp_signal: the `torch.int32` completion signal produced by DeepGEMM for each expert token block.
+            comp_signal: the `torch.int32` completion signal produced by DeepGEMM for each expert token block. It must be
+                reset to zero before every DeepGEMM launch and cannot be reused until the previous combine has finished.
             block_m: the number of tokens represented by each completion signal element.
             threshold: a block can be sent after its completion signal reaches this value.
             num_sms: the number of SMs reserved for the SBO combine send phase.
@@ -678,6 +679,10 @@ class Buffer:
         if overlap:
             if not return_recv_hook:
                 raise ValueError('SBO overlap requires return_recv_hook=True')
+            if async_finish:
+                raise ValueError('SBO overlap does not support async_finish=True')
+            if zero_copy:
+                raise ValueError('SBO overlap does not support zero_copy yet')
             if use_logfmt:
                 raise ValueError('SBO overlap does not support LogFMT yet')
             if packed_recv_count is None:
@@ -692,12 +697,14 @@ class Buffer:
                 raise ValueError('comp_signal must be a contiguous torch.int32 tensor on the same device as x')
             if block_m <= 0 or threshold <= 0 or num_sms <= 0:
                 raise ValueError('block_m, threshold, and num_sms must be positive in SBO overlap mode')
+            num_device_sms = torch.cuda.get_device_properties(x.device).multi_processor_count
+            if num_sms >= num_device_sms:
+                raise ValueError(f'num_sms must be smaller than the device SM count ({num_device_sms}) to leave resources for DeepGEMM')
             num_signals_per_expert = (self.group_size * num_max_dispatch_tokens_per_rank + block_m - 1) // block_m
             if comp_signal.dim() != 1 or comp_signal.numel() < num_local_experts * num_signals_per_expert:
                 raise ValueError('comp_signal is too small for the configured experts, token capacity, and block_m')
             if use_dual_qp and self.num_qps_per_rank < 2 * num_local_experts:
                 raise ValueError(f'use_dual_qp requires at least {2 * num_local_experts} QPs per rank')
-            raise NotImplementedError('SBO overlap kernel will be added in the next migration stage')
         if use_dual_qp:
             raise NotImplementedError('Dual-QP communication will be added in a later migration stage')
 

@@ -711,6 +711,147 @@ __forceinline__ __device__ void decode_and_accumulate(
     }
 }
 
+template <int kHidden, int kNumThreads>
+__global__ __launch_bounds__(kNumThreads, 1) void combine_send_sbo(void* rdma_recv_x,
+                                                                 int* rdma_recv_flag,
+                                                                 void* rdma_send_x,
+                                                                 const void* x,
+                                                                 const int* src_info,
+                                                                 const int64_t* layout_range,
+                                                                 int* mask_buffer_ptr,
+                                                                 const int* packed_recv_count,
+                                                                 const int* comp_signal,
+                                                                 int block_m,
+                                                                 int threshold,
+                                                                 int* next_clean,
+                                                                 int num_next_clean_int,
+                                                                 int* atomic_clean_flag,
+                                                                 int num_max_dispatch_tokens_per_rank,
+                                                                 int num_experts,
+                                                                 int rank,
+                                                                 int num_ranks,
+                                                                 bool zero_copy) {
+    constexpr int kNumWarpsPerBlock = kNumThreads / 32;
+    constexpr int kNumElemsPerInt4 = sizeof(int4) / sizeof(nv_bfloat16);
+    constexpr int kHiddenInt4 = kHidden / kNumElemsPerInt4;
+    constexpr int kNumMetaBytes = kHidden / 128 * sizeof(nv_bfloat162);
+    constexpr int kNumBytesPerSlot = kHidden * sizeof(nv_bfloat16) + kNumMetaBytes;
+    constexpr int kNumSendBytes = kHidden * sizeof(nv_bfloat16);
+    EP_STATIC_ASSERT(kNumThreads % 32 == 0, "Invalid thread count");
+    EP_STATIC_ASSERT(kHidden % kNumElemsPerInt4 == 0, "Invalid hidden size");
+
+    const auto lane_id = get_lane_id();
+    const auto warp_id = static_cast<int>(threadIdx.x) / 32;
+    const auto global_warp_id = static_cast<int>(blockIdx.x) * kNumWarpsPerBlock + warp_id;
+    const auto num_global_warps = static_cast<int>(gridDim.x) * kNumWarpsPerBlock;
+    const auto num_local_experts = num_experts / num_ranks;
+    const auto num_signals_per_expert = ceil_div(num_ranks * num_max_dispatch_tokens_per_rank, block_m);
+
+    // The next low-latency buffer can be cleaned while current data is being sent.
+    if (blockIdx.x == 0 and warp_id == 0) {
+        for (int i = lane_id; i < num_next_clean_int; i += 32)
+            next_clean[i] = 0;
+        __syncwarp();
+        if (lane_id == 0)
+            atomic_add_release_global(atomic_clean_flag, num_experts);
+    }
+
+    // Each task uniquely owns one (local expert, destination rank) pair and therefore one peer QP.
+    for (int task_idx = global_warp_id; task_idx < num_experts; task_idx += num_global_warps) {
+        const int local_expert_idx = task_idx / num_ranks;
+        const int dst_rank = task_idx % num_ranks;
+        const int global_expert_idx = rank * num_local_experts + local_expert_idx;
+        const auto layout = __ldg(layout_range + local_expert_idx * num_ranks + dst_rank);
+        int num_tokens_to_send, offset;
+        unpack2(layout, num_tokens_to_send, offset);
+        EP_DEVICE_ASSERT(offset >= 0 and num_tokens_to_send >= 0);
+        EP_DEVICE_ASSERT(offset + num_tokens_to_send <= packed_recv_count[local_expert_idx]);
+
+        bool rank_masked = is_rank_masked<true>(mask_buffer_ptr, dst_rank);
+        const auto local_x = static_cast<const int4*>(x) +
+            local_expert_idx * num_ranks * num_max_dispatch_tokens_per_rank * kHiddenInt4;
+        const auto local_src_info = src_info + local_expert_idx * num_ranks * num_max_dispatch_tokens_per_rank;
+        const auto local_send_buffer = static_cast<uint8_t*>(rdma_send_x) +
+            local_expert_idx * num_ranks * num_max_dispatch_tokens_per_rank * kNumBytesPerSlot;
+
+        if (not rank_masked) {
+            int previous_signal_idx = -1;
+            for (int token_idx = offset; token_idx < offset + num_tokens_to_send; ++token_idx) {
+                const int signal_idx = token_idx / block_m;
+                if (signal_idx != previous_signal_idx) {
+                    const auto signal_ptr = comp_signal + local_expert_idx * num_signals_per_expert + signal_idx;
+                    const auto start_time = clock64();
+                    auto wait_cycles = static_cast<uint64_t>(0);
+                    while (ld_acquire_global(signal_ptr) < threshold and not rank_masked and wait_cycles <= LEGACY_NUM_TIMEOUT_CYCLES) {
+                        rank_masked = is_rank_masked<true>(mask_buffer_ptr, dst_rank);
+                        wait_cycles = clock64() - start_time;
+                    }
+                    if (wait_cycles > LEGACY_NUM_TIMEOUT_CYCLES) {
+                        if (lane_id == 0)
+                            printf("Warning: DeepEP timeout waiting for SBO signal, rank %d, local_expert_idx %d, dst_rank %d, signal_idx %d\n",
+                                   rank,
+                                   local_expert_idx,
+                                   dst_rank,
+                                   signal_idx);
+                        if (mask_buffer_ptr == nullptr)
+                            trap();
+                        else if (lane_id == 0)
+                            atomicExch(mask_buffer_ptr + dst_rank, 1);
+                        rank_masked = true;
+                    }
+                    __syncwarp();
+                    previous_signal_idx = signal_idx;
+                }
+                if (rank_masked)
+                    break;
+
+                const auto src_idx = __shfl_sync(0xffffffff, __ldg(local_src_info + token_idx), 0);
+                const auto x_int4 = local_x + token_idx * kHiddenInt4;
+                const auto send_row = local_send_buffer + token_idx * kNumBytesPerSlot;
+                const auto send_int4 = reinterpret_cast<int4*>(send_row);
+                const auto dst_ptr = reinterpret_cast<uint64_t>(rdma_recv_x) +
+                    (global_expert_idx * num_max_dispatch_tokens_per_rank + src_idx) * kNumBytesPerSlot;
+                const auto dst_p2p_ptr = nvshmemi_get_p2p_ptr(dst_ptr, rank, dst_rank);
+
+                if (dst_p2p_ptr == 0) {
+                    if (not zero_copy) {
+                        UNROLLED_WARP_COPY(4, lane_id, kHiddenInt4, send_int4, x_int4, ld_nc_global, st_na_global);
+                        __syncwarp();
+                    }
+                    nvshmemi_ibgda_put_nbi_warp(dst_ptr,
+                                                reinterpret_cast<uint64_t>(send_row),
+                                                kNumSendBytes,
+                                                dst_rank,
+                                                local_expert_idx,
+                                                lane_id,
+                                                token_idx - offset);
+                } else {
+                    const auto copy_src = zero_copy ? send_int4 : x_int4;
+                    const auto copy_dst = reinterpret_cast<int4*>(dst_p2p_ptr);
+                    UNROLLED_WARP_COPY(4, lane_id, kHiddenInt4, copy_dst, copy_src, ld_nc_global, st_na_global);
+                    __syncwarp();
+                }
+            }
+        }
+
+        // The finish notification is ordered after all data writes on the same peer QP.
+        if (lane_id == 0) {
+            while (ld_acquire_global(atomic_clean_flag) == 0)
+                ;
+            if (not rank_masked) {
+                const auto flag_ptr = reinterpret_cast<uint64_t>(rdma_recv_flag + global_expert_idx);
+                const auto flag_p2p_ptr = nvshmemi_get_p2p_ptr(flag_ptr, rank, dst_rank);
+                if (flag_p2p_ptr == 0)
+                    nvshmemi_ibgda_amo_nonfetch_add(reinterpret_cast<int*>(flag_ptr), 1, dst_rank, local_expert_idx);
+                else
+                    st_release_sys_global(reinterpret_cast<int*>(flag_p2p_ptr), 1);
+            }
+            atomic_add_release_global(atomic_clean_flag, -1);
+        }
+        __syncwarp();
+    }
+}
+
 template <bool kUseLogFMT, int kHidden, int kNumMaxTopk, int kNumMaxUnrolls>
 __global__ __launch_bounds__(1024, 1) void combine(void* combined_x,
                                                    void* rdma_recv_x,
@@ -1170,13 +1311,44 @@ void combine(void* combined_x,
              cudaStream_t stream,
              int phases,
              bool zero_copy) {
-    EP_HOST_ASSERT(not overlap and "SBO overlap support is not implemented yet");
     EP_HOST_ASSERT(not use_dual_qp and "Dual-QP support is not implemented yet");
-    (void)packed_recv_count;
-    (void)comp_signal;
-    (void)block_m;
-    (void)threshold;
-    (void)num_sbo_sms;
+    if (overlap and phases == LEGACY_LOW_LATENCY_SEND_PHASE) {
+        EP_HOST_ASSERT(not use_logfmt and not zero_copy and packed_recv_count != nullptr and comp_signal != nullptr);
+        EP_HOST_ASSERT(block_m > 0 and threshold > 0 and num_sbo_sms > 0 and num_sbo_sms < num_device_sms);
+        constexpr int kNumThreads = 256;
+        auto atomic_clean_flag = static_cast<int*>(workspace);
+
+        // Use a regular launch so the signal-waiting consumer can run concurrently with DeepGEMM.
+#define COMBINE_SBO_LAUNCH_CASE(hidden)                                                                                     \
+    {                                                                                                                       \
+        combine_send_sbo<hidden, kNumThreads><<<num_sbo_sms, kNumThreads, 0, stream>>>(                                    \
+            rdma_recv_x,                                                                                                    \
+            rdma_recv_flag,                                                                                                 \
+            rdma_send_x,                                                                                                    \
+            x,                                                                                                              \
+            src_info,                                                                                                       \
+            layout_range,                                                                                                   \
+            mask_buffer_ptr,                                                                                                \
+            packed_recv_count,                                                                                              \
+            comp_signal,                                                                                                    \
+            block_m,                                                                                                        \
+            threshold,                                                                                                      \
+            next_clean,                                                                                                     \
+            num_next_clean_int,                                                                                             \
+            atomic_clean_flag,                                                                                              \
+            num_max_dispatch_tokens_per_rank,                                                                               \
+            num_experts,                                                                                                    \
+            rank,                                                                                                           \
+            num_ranks,                                                                                                      \
+            zero_copy);                                                                                                     \
+        CUDA_RUNTIME_CHECK(cudaGetLastError());                                                                              \
+    }                                                                                                                       \
+    break
+        SWITCH_HIDDEN(COMBINE_SBO_LAUNCH_CASE);
+#undef COMBINE_SBO_LAUNCH_CASE
+        return;
+    }
+    EP_HOST_ASSERT(not overlap or phases == LEGACY_LOW_LATENCY_RECV_PHASE);
 
     constexpr int kNumMaxTopk = 11;
     const int num_warp_groups = ceil_div(num_experts, num_device_sms);

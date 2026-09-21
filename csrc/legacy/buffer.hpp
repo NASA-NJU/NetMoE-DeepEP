@@ -1620,6 +1620,8 @@ public:
 
         if (overlap) {
             EP_HOST_ASSERT(return_recv_hook and "SBO overlap requires return_recv_hook=True");
+            EP_HOST_ASSERT(not async and "SBO overlap does not support async=True");
+            EP_HOST_ASSERT(not zero_copy and "SBO overlap does not support zero-copy yet");
             EP_HOST_ASSERT(not use_logfmt and "SBO overlap does not support LogFMT yet");
             EP_HOST_ASSERT(packed_recv_count.has_value() and "SBO overlap requires packed_recv_count");
             EP_HOST_ASSERT(comp_signal.has_value() and "SBO overlap requires comp_signal");
@@ -1660,7 +1662,6 @@ public:
             EP_HOST_ASSERT(comp_signal->is_cuda() and comp_signal->get_device() == x.get_device());
             EP_HOST_ASSERT(comp_signal->scalar_type() == torch::kInt32 and comp_signal->is_contiguous());
             EP_HOST_ASSERT(comp_signal->dim() == 1 and comp_signal->numel() >= num_local_experts * num_signals_per_expert);
-            EP_HOST_ASSERT(false and "SBO overlap support is not implemented yet");
         }
 
         auto hidden = static_cast<int>(x.size(2));
